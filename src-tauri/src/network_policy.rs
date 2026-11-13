@@ -92,7 +92,8 @@ pub fn allowed_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let [a, b, c, _] = ip.octets();
-            if a == 198 && (b == 18 || b == 19) {
+            // Clash Verge 默认 FakeIP 是 28.0.0.0/8；常见还有 198.18.0.0/15。
+            if a == 28 || (a == 198 && (b == 18 || b == 19)) {
                 return true;
             }
             !(a == 0
@@ -162,7 +163,7 @@ fn check_ip(ip: IpAddr) -> Result<(), String> {
     if allowed_ip(ip) {
         Ok(())
     } else {
-        Err("禁止访问普通内网、回环或保留地址（仅放行 FakeIP 198.18.0.0/15）".into())
+        Err("禁止访问普通内网、回环或保留地址（仅放行 FakeIP 198.18.0.0/15 与 28.0.0.0/8）".into())
     }
 }
 
@@ -276,10 +277,13 @@ mod tests {
         for ip in [
             "1.1.1.1",
             "8.8.8.8",
+            "28.0.0.1",
+            "28.255.255.255",
             "198.18.0.0",
             "198.19.255.255",
             "2606:4700:4700::1111",
             "::ffff:198.18.0.1",
+            "::ffff:28.0.0.6",
         ] {
             assert!(allowed_ip(ip.parse().unwrap()), "{ip}");
         }

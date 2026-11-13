@@ -368,8 +368,9 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     api.play(curId, curEp)
       .then((info) => {
         if (!alive) return;
-        if (!info?.video_url) throw new Error("暂无播放地址");
-        setPlayUrls((m) => ({ ...m, [playKey]: info.video_url }));
+        const url = info?.video_url || info?.streams?.main || info?.streams?.hevc || info?.streams?.preview || "";
+        if (!url) throw new Error("暂无播放地址");
+        setPlayUrls((m) => ({ ...m, [playKey]: url }));
         addHistory(curId, curEp);
       })
       .catch((e) => { if (alive) setErr((e as Error).message || "取播放地址失败"); });

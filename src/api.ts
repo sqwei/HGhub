@@ -147,8 +147,9 @@ export async function selfTest(): Promise<string> {
   const steps: string[] = [];
   try {
     const info = await api.play(117, 3);
-    steps.push(`play:${info?.video_url ? "ok" : "empty"}`);
-    const hlsUrl = `${LOCAL}/hls?u=${encodeURIComponent(info.video_url)}`;
+    const playUrl = info?.video_url || info?.streams?.main || info?.streams?.hevc || "";
+    steps.push(`play:${playUrl ? "ok" : "empty"}`);
+    const hlsUrl = `${LOCAL}/hls?u=${encodeURIComponent(playUrl)}`;
     const r1 = await fetch(hlsUrl);
     const txt = await r1.text();
     steps.push(`hls:${r1.status}/${txt.length}/${txt.startsWith("#EXTM3U") ? "m3u8" : "bad"}`);

@@ -475,11 +475,16 @@ pub async fn api_video(state: State<'_, Api>, id: i64) -> Result<Value, String> 
 fn normalize_play_info(info: &mut Value) {
     fn non_empty(v: Option<&Value>) -> Option<String> {
         v.and_then(|x| x.as_str())
+            .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
     }
-    let main = non_empty(info.get("streams").and_then(|s| s.get("main")));
-    let hevc = non_empty(info.get("streams").and_then(|s| s.get("hevc")));
+    let streams = info.get("streams");
+    // main → hevc → preview，任一可用即可开播
+    let main = non_empty(streams.and_then(|s| s.get("main")))
+        .or_else(|| non_empty(streams.and_then(|s| s.get("hevc"))))
+        .or_else(|| non_empty(streams.and_then(|s| s.get("preview"))));
+    let hevc = non_empty(streams.and_then(|s| s.get("hevc")));
     let Some(obj) = info.as_object_mut() else { return };
     for (field, stream) in [("video_url", main), ("video_url_hevc", hevc)] {
         if let Some(url) = stream {
@@ -493,37 +498,80 @@ fn normalize_play_info(info: &mut Value) {
 fn has_play_url(info: &Value) -> bool {
     info.get("video_url")
         .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty())
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+/// 播放响应里的 CDN 鉴权头要带进后续 m3u8/分片请求，否则清单常会 TLS/403 失败。
+fn remember_cdn_auth(info: &Value) {
+    let cdn = info.get("cdn");
+    let key = cdn
+        .and_then(|c| c.get("authKey"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let value = cdn
+        .and_then(|c| c.get("authValue"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let (Some(key), Some(value)) = (key, value) else {
+        return;
+    };
+    for field in ["video_url", "video_url_hevc"] {
+        if let Some(url) = info.get(field).and_then(|v| v.as_str()) {
+            crate::net::remember_cdn_auth_for_url(url, key, value);
+        }
+    }
+    if let Some(streams) = info.get("streams").and_then(|s| s.as_object()) {
+        for v in streams.values() {
+            if let Some(url) = v.as_str() {
+                crate::net::remember_cdn_auth_for_url(url, key, value);
+            }
+        }
+    }
+}
+
+fn finish_play_info(mut info: Value) -> Result<Value, String> {
+    normalize_play_info(&mut info);
+    if !has_play_url(&info) {
+        return Err("暂无播放地址".into());
+    }
+    remember_cdn_auth(&info);
+    Ok(info)
 }
 
 #[tauri::command]
 pub async fn api_play(state: State<'_, Api>, id: i64, ep: u32) -> Result<Value, String> {
-    // 优先走新接口；失败或没有可用地址时再退回旧接口，两者都不行就返回新接口的结果/错误。
-    let primary = state
-        .post(&format!("/api/videos/{id}/episodes/{ep}/playback"), Some(json!({})))
-        .await
-        .map(|mut info| {
-            normalize_play_info(&mut info);
-            info
-        });
-    if let Ok(info) = &primary {
-        if has_play_url(info) {
-            return primary;
+    // 上游已切到 streams.*；旧 /play 仍 200 但 video_url 恒空。
+    // 只返回「真正带地址」的结果；绝不能把空成功回给前端（否则只会看到「暂无播放地址」）。
+    let ep = ep.max(1);
+    let mut last_err = String::from("暂无播放地址");
+
+    // `/api/videos/{id}/playback` 空 body 默认第 1 集，仅作 ep=1 的兜底，避免误播。
+    let mut paths = vec![format!("/api/videos/{id}/episodes/{ep}/playback")];
+    if ep == 1 {
+        paths.push(format!("/api/videos/{id}/playback"));
+    }
+    for path in paths {
+        match state.post(&path, Some(json!({}))).await {
+            Ok(info) => match finish_play_info(info) {
+                Ok(info) => return Ok(info),
+                Err(e) => last_err = e,
+            },
+            Err(e) => last_err = e,
         }
     }
+
     match state
         .get(&format!("/api/videos/{id}/play?ep={ep}&page_texts=0"))
         .await
     {
-        Ok(mut legacy) => {
-            normalize_play_info(&mut legacy);
-            if has_play_url(&legacy) || primary.is_err() {
-                Ok(legacy)
-            } else {
-                primary
-            }
-        }
-        Err(_) => primary,
+        Ok(info) => finish_play_info(info),
+        Err(e) => Err(if last_err == "暂无播放地址" {
+            e
+        } else {
+            last_err
+        }),
     }
 }
 
@@ -626,7 +674,7 @@ pub async fn api_post_comments(
 }
 #[cfg(test)]
 mod tests {
-    use super::{has_play_url, is_newer, normalize_play_info};
+    use super::{finish_play_info, has_play_url, is_newer, normalize_play_info};
     use serde_json::{json, Value};
 
     #[test]
@@ -639,6 +687,19 @@ mod tests {
         assert_eq!(info["video_url"], "https://x/main.m3u8");
         assert_eq!(info["video_url_hevc"], "https://x/hevc.m3u8");
         assert!(has_play_url(&info));
+    }
+
+    #[test]
+    fn preview_or_hevc_can_fill_video_url_when_main_missing() {
+        let mut hevc_only = json!({"video_url": "", "streams": {"main": "", "hevc": "https://x/hevc.m3u8"}});
+        normalize_play_info(&mut hevc_only);
+        assert_eq!(hevc_only["video_url"], "https://x/hevc.m3u8");
+
+        let mut preview_only = json!({"streams": {"preview": "https://x/p.m3u8"}});
+        normalize_play_info(&mut preview_only);
+        assert_eq!(preview_only["video_url"], "https://x/p.m3u8");
+        assert!(finish_play_info(preview_only).is_ok());
+        assert!(finish_play_info(json!({"video_url": "", "streams": {"main": ""}})).is_err());
     }
 
     #[test]

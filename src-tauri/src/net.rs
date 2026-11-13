@@ -37,6 +37,45 @@ pub const DEFAULT_BASE: &str = "https://huangguoai.com";
 static BASE: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(DEFAULT_BASE.to_string()));
 /// 线路配置落盘位置（应用数据目录/line.json），由 [`bind_base`] 在启动时绑定。
 static BASE_FILE: Lazy<RwLock<Option<PathBuf>>> = Lazy::new(|| RwLock::new(None));
+/// 播放接口下发的 CDN 鉴权：按主机记住，供后续 m3u8/分片 GET 带上。
+static CDN_AUTH: Lazy<Mutex<HashMap<String, (String, String)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// 记住某条流地址所属主机的 CDN 鉴权头（来自 playback 的 `cdn.authKey/authValue`）。
+pub fn remember_cdn_auth_for_url(raw: &str, key: &str, value: &str) {
+    let Ok(url) = url::Url::parse(raw) else {
+        return;
+    };
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return;
+    };
+    if key.is_empty() || value.is_empty() || key.len() > 64 || value.len() > 256 {
+        return;
+    }
+    if !key
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return;
+    }
+    if let Ok(mut map) = CDN_AUTH.lock() {
+        if map.len() >= 64 && !map.contains_key(&host) {
+            if let Some(old) = map.keys().next().cloned() {
+                map.remove(&old);
+            }
+        }
+        map.insert(host, (key.to_string(), value.to_string()));
+    }
+}
+
+fn cdn_auth_for_url(raw: &str) -> Option<(String, String)> {
+    let url = url::Url::parse(raw).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    CDN_AUTH
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&host).cloned())
+}
 
 /// 当前上游基址。
 pub fn base() -> String {
@@ -222,6 +261,10 @@ pub async fn get(
             }
             if let Some(value) = referer {
                 request = request.header("Referer", value);
+            }
+            // 播放 CDN 常要求 x-cdn-auth；鉴权来自最近一次 playback 响应。
+            if let Some((key, value)) = cdn_auth_for_url(target.as_str()) {
+                request = request.header(key, value);
             }
             let response = request.send().await.map_err(|e| err_text(&e))?;
             if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
